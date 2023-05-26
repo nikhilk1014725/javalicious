@@ -1,0 +1,428 @@
+import logging
+from warnings import catch_warnings
+
+import azure.functions as func
+
+import pyodbc
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import DBSCAN
+
+print('Testing')
+def main():
+    logging.info('#### HTTP trigger clustering cv function processed a request.')
+    print('testing_inside_main')
+    # PARAMETRES
+    startdate = "06/01/2022"
+    enddate = "06/30/2022"
+    clientname = "gecia"
+    targetdatabase = 'BoostLab_Prod'
+    # startdate = req.params.get('startdate')
+    # if not startdate:
+    #     try:
+    #         logging.info(req.get_json())
+    #         req_body = req.get_json()
+    #     except ValueError:
+    #         pass
+    #     else:
+    #         logging.info(req_body)
+    #         startdate = req_body.get('startdate')
+    #
+    # enddate = req.params.get('enddate')
+    # if not enddate:
+    #     try:
+    #         req_body = req.get_json()
+    #     except ValueError:
+    #         pass
+    #     else:
+    #         enddate = req_body.get('enddate')
+    #
+    # clientname = req.params.get('clientname')
+    # if not clientname:
+    #     try:
+    #         req_body = req.get_json()
+    #     except ValueError:
+    #         pass
+    #     else:
+    #         clientname = req_body.get('clientname')
+    #
+    # targetdatabase = req.params.get('targetdatabase')
+    # if not targetdatabase:
+    #     try:
+    #         req_body = req.get_json()
+    #     except ValueError:
+    #         pass
+    #     else:
+    #         targetdatabase = req_body.get('targetdatabase')
+
+    logging.info(f"### Parameters startdate: {startdate}, enddate: {enddate}, clientname: {clientname} or targetdatabase: {targetdatabase}")
+    print(startdate)
+    # print(f'1.' + startdate + '2.' + enddate + '3.' + clientname + '4.' + targetdatabase)
+    if (startdate and enddate and clientname and targetdatabase):
+
+        # DEBUT DE L EXECUTION
+        print('Inside main If')
+        now = datetime.now()
+        dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
+        logging.info(f"### Start: {dt_string}")
+
+        # CONNEXION DB AZURE
+        # testing purpose code
+        server = 'ac-sql-d-app-102001.database.windows.net'
+        login = 'gre_adm'
+        password = 'P1v@utw@1re1'
+
+        driver = '{ODBC Driver 17 for SQL Server}'
+        connectionstring = 'DRIVER=' + driver + ';SERVER=' + server + ';PORT=1433;DATABASE=' + targetdatabase + ';UID=' + login + ';PWD=' + password
+
+        conn = pyodbc.connect(connectionstring)
+
+        cursor = conn.cursor()
+
+        print('Connection_String and cursor Created')
+
+        # On insert un nouveau log_cluster  et on récupère l'identifiant
+        logging.info("## REQUEST selection start")
+
+        REQUETESelection = "DECLARE @LogClusterId int;" \
+                        "exec [dbo].[log_cluster_insert] '"+startdate+"','"+enddate+"','"+clientname+"',@LogClusterId"
+        cursor.execute(REQUETESelection)
+        rows = cursor.fetchall()
+        LogClusterId= rows[0][0]
+
+        logging.info("## REQUEST selection end")
+
+        # On recupère l'eventuel filtre associé au client
+        logging.info("## REQUEST filter start")
+
+        REQUETEFILTRE = "SELECT Filtre from dbo.LOG_CLIENT WHERE ClientName = '"+clientname +"'"
+        cursor = conn.cursor()
+        FiltreResult = pd.read_sql_query(REQUETEFILTRE, conn)
+
+        logging.info("## REQUEST filter end")
+
+        # REQUETE Nr 1 : On récupère les StepId a étudier (+ de 500 resultats sur la période)
+        # TODO : convert in prostock ?
+        logging.info("## REQUEST request #1 start")
+
+        REQUETE1 = """
+        SELECT DISTINCT StepId 
+        FROM """+clientname+""".CV_RESULT R
+        where Datetime between ? and ? and StepId IS NOT NULL and Report ='OK' """+str(FiltreResult.Filtre.item())+""" 
+        group by StepId 
+        having SUM(CASE WHEN Report='OK' THEN 1 ELSE 0 END) > 500 and 
+        AVG(FinalAngle) > 0 and AVG(FinalTorque) >0 """
+
+        paramStep = (startdate, enddate)
+        cursor = conn.cursor()
+        dataStep = pd.read_sql_query(REQUETE1, conn, params=paramStep)
+
+        logging.info("## REQUEST request #1 end")
+
+
+        # REQUETE Nr2 : Pour chaque StepId, on récupère les Angle et Torques
+        logging.info("## REQUEST request #2 start")
+
+        # testing purpose code
+        i = 1
+        iteration_number = 0
+        # testing purpose code
+
+        for StepId in dataStep.StepId:
+            logging.info(f"# StepId: {StepId}")
+
+
+
+            # testing purpose code
+            iteration_number += i  # Calculate the iteration number
+            print("Iteration:", iteration_number)
+            print(StepId)
+            # testing purpose code
+
+            # TODO : convert in prostock ?
+            try:
+                REQUETE2 = "" \
+                "SELECT FinalTorque,FinalAngle from "+clientname+".CV_RESULT R where Datetime between ? and ? " \
+                "and StepId = ? and Report='OK' """+str(FiltreResult.Filtre.item())
+                params = (startdate, enddate, StepId)
+                data = pd.read_sql_query(REQUETE2, conn, params=params)
+
+                #On calcule les moyennes afin de calculer la distance entre les points
+                #Après plusieurs test, les valeur 0.01 et 5 ont été choisi car elles présentaient les meilleurs résultats
+                AVGTorque = np.mean(data.FinalTorque)
+                AVGAngle = np.mean(data.FinalAngle)
+                MaxAvg = max(AVGAngle, AVGTorque)
+
+                logging.info(f"  {AVGTorque}")
+                logging.info(f"  {AVGAngle}")
+                #Pour1 = MaxAvg * 0.01
+                Pour1 = MaxAvg * 0.03
+                min_samples = 5
+
+                # Après avoir normalisé les données avec StandarScaler, un clustering par densité est appliqué.
+                scaler = StandardScaler()
+                scaled_data = scaler.fit_transform(data)
+                DbScan = DBSCAN(eps=Pour1, min_samples=min_samples)
+                labels = DbScan.fit_predict(scaled_data)
+
+                # Recuperation des résultats de cluster
+                frame = pd.DataFrame(scaled_data)
+                frame['cluster'] = labels
+                frame.columns = ['FinalAngle', 'FinalTorque', 'cluster']
+
+                # Calcul du nombre de point par cluster
+                NB1 = 0
+                NB2 = 0
+                NB3 = 0
+                NB4 = 0
+                NB5 = 0
+                NB6 = 0
+                NBNoCluster = 0
+                NbCluster = max(labels)
+
+                for n_cluster_label in labels:
+                    if n_cluster_label == 0:
+                        NB1 = NB1 + 1
+                    if n_cluster_label == 1:
+                        NB2 = NB2 + 1
+                    if n_cluster_label == 2:
+                        NB3 = NB3 + 1
+                    if n_cluster_label == 3:
+                        NB4 = NB4 + 1
+                    if n_cluster_label == 4:
+                        NB5 = NB5 + 1
+                    if n_cluster_label == 5:
+                        NB6 = NB6 + 1
+                    if n_cluster_label == -1:
+                        NBNoCluster = NBNoCluster +1
+
+                # Insertion des résultats dans Azure
+                # TODO : convert in prostock ?
+                REQUETE3 = "INSERT INTO "+clientname+".RESULT_CLUSTER(StepID,datedebut,datefin,NbCluster,C1,C2,C3,C4,C5,C6,NoCluster,eps,min_samples,LogClusterId) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                Result = [StepId, startdate, enddate, int(NbCluster), NB1, NB2, NB3, NB4, NB5, NB6,NBNoCluster, Pour1, min_samples,LogClusterId]
+                cursor.execute(REQUETE3, Result)
+                conn.commit()
+                plt.close('all')
+
+            except ValueError:
+                logging.error(f"ValueError {StepId} {StepId}")
+            except:
+                logging.error(f"Error {StepId} {StepId}")
+
+        logging.info("## REQUEST request #2 end")
+        print('For Loop completed')
+        #Après avoir vérifier les cluster pour tous les Steps, on choisit ceux que l'on veut afficher dans le rapport
+        logging.info("## REQUEST request #4 start")
+
+        print('running REQUETE4')
+        # TODO : convert in prostock ?
+        REQUETE4 = "select R.StepId,eps,min_samples,RANK() OVER (ORDER BY C2 desc ,eps ) as RankScoreCluster from "+clientname+".[RESULT_CLUSTER] R inner join "+clientname+".CV_STEP S ON R.StepId = S.StepId  inner join "+clientname+".CV_RESULT RR on R.StepId = RR.StepID AND DateTime between CAST( ? AS DATE)  AND  CAST( ? AS DATE)  and LogClusterId = ? and Report= 'OK' where C2 <> 0 and datedebut =CAST( ? AS DATE)  AND datefin = CAST( ?  AS DATE) GROUP BY R.StepId,NbCluster,eps,min_samples,C1,C2,C3,C4,C5,C6,TorqueTarget,TorqueMinTolerance,TorqueMaxTolerance,AngleTarget,AngleMaxTolerance,AngleMinTolerance HAVING ((Max(FinalTorque) - min(FinalTorque)) / (CASE WHEN TorqueTarget = 0 THEN AVG(FinalTorque) ELSE TorqueTarget END ) * 100 > 5) AND ((max(FinalAngle) - min(FinalAngle)) / (CASE WHEN AngleTarget = 0 THEN AVG(FinalAngle) ELSE AngleTarget END) * 100 > 10 ) AND ((C2/ (0.01 * (C1+C2+C3+C4+C5+C6)) > 0.1) OR (C3/ (0.01 * (C1+C2+C3+C4+C5+C6)) > 0.1) OR (C4/ (0.01 * (C1+C2+C3+C4+C5+C6)) > 0.1) OR (C5/ (0.01 * (C1+C2+C3+C4+C5+C6)) > 0.1) OR (C6/ (0.01 * (C1+C2+C3+C4+C5+C6)) > 0.1))"
+        paramStep = (startdate, enddate, LogClusterId, startdate, enddate)
+        cursor = conn.cursor()
+        StepToCheck = pd.read_sql_query(REQUETE4, conn, params=paramStep)
+
+        print('ran REQUETE4')
+
+        logging.info(StepToCheck)
+        logging.info("## REQUEST request #4 end")
+
+        #REQUETEStepSelection = " SELECT StepId,Selection from "+ClientName+".RESULT_CLUSTER where startdate = ? and enddate = ? and Selection is not null"
+        #paramStep = (startdate, enddate)
+        #cursor = conn.cursor()
+        #StepToCheck = pd.read_sql_query(REQUETEStepSelection, conn, params=paramStep)
+
+        #Pour les Steps que l'on veut étudier, on relance un clustering par densite afin d'avoir le cluster pour chaque point
+
+
+        REQUESTTABLE = "CREATE TABLE ##DataCluster\
+        (\
+            [ResultId] [int] NULL,\
+            [StepId] [int] NULL,\
+            [datedebut] [date] NULL,\
+            [datefin] [date] NULL,\
+            [Torque] [float] NULL,\
+            [Angle] [float] NULL,\
+            [Cluster] [int] NULL,\
+            [Datetime] [datetime] NULL,\
+            [RankScoreCluster] [int] NULL,\
+            [LogClusterId] [INT] NULL\
+        )"
+        cursor.execute(REQUESTTABLE)
+        testing_Varible = 0
+
+
+        # testing purpose code
+        print("Created #datacluster Table")
+        i = 1
+        iteration_number = 0
+        # testing purpose code
+
+        for i in StepToCheck.RankScoreCluster-1:
+
+            # testing purpose code
+            iteration_number += i  # Calculate the iteration number
+            print("Iteration:", iteration_number)
+            # testing purpose code
+
+            print()
+            logging.info(f"# Step Nr :  {StepToCheck.StepId[i]}")
+            #print("Step Nr : ", StepToCheck.StepId[i])
+            params = (startdate, enddate, int(StepToCheck.StepId[i]))
+            REQUETE5 = "SELECT ResultId,FinalAngle,FinalTorque,DateTime as DatetimeResult from "+clientname+".CV_RESULT R where cast(Datetime as date) between ? and ? and StepId = ? and Report='OK' "+str(FiltreResult.Filtre.item())
+            data = pd.read_sql_query(REQUETE5, conn, params=params)
+
+            logging.info("# Normalise datas")
+            AngleTorqueDataset = data[['FinalAngle', 'FinalTorque']].copy()
+            scaler = StandardScaler()
+            scaled_data = scaler.fit_transform(AngleTorqueDataset)
+
+            logging.info("# Clustering density")
+            DbScan = DBSCAN(eps=StepToCheck.eps[i], min_samples=StepToCheck.min_samples[i])
+            labels = DbScan.fit_predict(scaled_data)
+
+            frame = pd.DataFrame(scaled_data)
+            frame['cluster'] = labels
+            frame.columns = ['FinalAngle', 'FinalTorque', 'cluster']
+
+            logging.info("# Insert data")
+            for y in range(len(frame)):
+                #REQUETE6 = "INSERT INTO "+ClientName+".[RESULT_CLUSTER_DETAILS](ResultId,StepId,startdate,enddate,Torque,Angle,Cluster,Datetime,RankScoreCluster) VALUES (?,?,?,?,?,?,?,?,?)"
+                REQUETE6 = "INSERT INTO ##DataCluster(ResultId,StepId,datedebut,datefin,Torque,Angle,Cluster,Datetime,LogClusterId) VALUES (?,?,?,?,?,?,?,?,?)"
+                Result = [int(data.ResultId[y]), int(StepToCheck.StepId[i]), startdate, enddate, data.FinalTorque[y], data.FinalAngle[y], int(frame.cluster[y]), data.DatetimeResult[y],LogClusterId]
+                cursor.execute(REQUETE6, Result)
+                conn.commit()
+
+            plt.close('all')
+        conn.commit()
+
+        print("ran 2nd for loop")
+
+        logging.info("## Insert all data")
+        REQUESTINSERT = "INSERT INTO "+clientname+".[RESULT_CLUSTER_DETAILS] SELECT * from ##DataCluster"
+        cursor.execute(REQUESTINSERT)
+        conn.commit()
+
+        print("Entering try, except")
+
+        #Après avoir vérifier les clusters potentiels , on fait une selection avec une procedure stockées dans Azure
+        logging.info(f"### Cluster selection start")
+        try:
+
+            REQUETESelection = "exec dbo.CV_Q_Cluster_selection '"+startdate+"','"+enddate+"','"+clientname+"'"
+            logging.info("REQUETESelection: " + REQUETESelection)
+            cursor.execute(REQUETESelection)
+            conn.commit()
+
+        except Exception as e:
+            logging.error(str(e))
+
+        logging.info(f"### Cluster selection end")
+
+
+
+
+        # 2EME PARTIE : DEFINITION DES LIMITES POUR LES POINTS ABERRANTS
+        #Definition des limites gauches et droites
+        def get_box_plot_data(labels, bp):
+
+            print("get_box_plot_data 1")
+
+            rows_list = []
+            for i in range(len(labels)):
+                dict1 = {}
+                dict1['label'] = labels[i]
+                dict1['lower_whisker'] = bp['whiskers'][i*2].get_ydata()[1]
+                dict1['upper_whisker'] = bp['whiskers'][(i*2)+1].get_ydata()[1]
+                rows_list.append(dict1)
+
+            return pd.DataFrame(rows_list)
+
+        #Definition des valeurs gauche et droite a récupérer
+        def get_box_plot_data2(labels, bp):
+
+            print("get_box_plot_data 2")
+
+            row_list2 = []
+            dict = {}
+            dict['LimitMinAngle'] = bp['whiskers'][0].get_ydata()[1]
+            dict['LimitMaxAngle'] = bp['whiskers'][1].get_ydata()[1]
+            dict['LimitMinTorque'] = bp['whiskers'][2].get_ydata()[1]
+            dict['LimitMaxTorque'] = bp['whiskers'][3].get_ydata()[1]
+            row_list2.append(dict)
+            return pd.DataFrame(row_list2)
+
+        #Récupérationdes Steps a étudier
+        cursor = conn.cursor()
+        paramStep = (startdate, enddate)
+        dataStep = pd.read_sql_query(REQUETE1, conn,params=paramStep)
+
+        # testing purpose code
+        print("Entering last for loop")
+        i = 1
+        iteration_number = 0
+        # testing purpose code
+
+        for StepId in dataStep.StepId:
+
+            # testing purpose code
+            iteration_number += i  # Calculate the iteration number
+            print("Iteration:", iteration_number)
+            # testing purpose code
+
+            REQUETE7 = "SELECT DISTINCT FinalAngle,FinalTorque FROM "+clientname+".CV_RESULT  where Datetime between ? and ? and StepId=? and Report = 'OK'"
+            paramsResult = (startdate, enddate, StepId)
+            dataResult = pd.read_sql_query(REQUETE7, conn,params=paramsResult)
+
+            #Creation d'une boite a moustache avec Angle et le Torque
+            labels = ['FinalAngle', 'FinalTorque']
+            bp = plt.boxplot([dataResult.FinalAngle, dataResult.FinalTorque], labels=labels)
+
+            #Récupération des valeurs de limites gauche et droite
+            MaxAngle = float(get_box_plot_data2(labels, bp).LimitMaxAngle)
+            MinAngle = float(get_box_plot_data2(labels, bp).LimitMinAngle)
+            MaxTorque = float(get_box_plot_data2(labels, bp).LimitMaxTorque)
+            MinTorque = float(get_box_plot_data2(labels, bp).LimitMinTorque)
+
+            #Insertion en DB
+            insertsql = "INSERT INTO "+clientname+".[RESULT_OUTLIERS](StepId, datedebut, datefin,LimitMinAngle,LimitMaxAngle,LimitMinTorque,LimitMaxTorque,LogClusterId) VALUES (?,?,?,?,?,?,?,?)"
+            Result = [StepId, startdate, enddate, MinAngle, MaxAngle, MinTorque, MaxTorque,LogClusterId]
+            cursor.execute(insertsql, Result)
+            conn.commit()
+
+
+        RequetUpdateLog = "exec dbo.log_cluster_updateRunEnd ?"
+        ParamUpdate = [LogClusterId]
+        cursor.execute(RequetUpdateLog, ParamUpdate)
+
+        print("Exit last loop")
+
+        # Cleanup
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        #Fin du traitement
+        now = datetime.now()
+        dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
+
+        message = f"#### HTTP trigger clustering cv function executed successfully at {dt_string}"
+        logging.info(message)
+
+        return func.HttpResponse(message)
+        print('End_of_if')
+    else:
+
+        message = f"#### HTTP trigger clustering cv function executed successfully, but missing a startdate, enddate, clientname or targetdatabase in the query string or in the request body for executing the script."
+        logging.info(message)
+
+        return func.HttpResponse(message, status_code=200)
+        print('End_of_else')
+
+if __name__ == "__main__":
+  main()
+
+print("at_the_end_of_code")
